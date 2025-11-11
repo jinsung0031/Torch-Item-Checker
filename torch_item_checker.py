@@ -22,9 +22,11 @@ so it can be launched with ``python torch_item_checker.py``.
 from __future__ import annotations
 
 import cmd
+import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Optional
+from pathlib import Path
+from typing import Iterable, List, Optional
 
 
 def _format_timedelta(delta: timedelta) -> str:
@@ -73,22 +75,51 @@ class Timer:
 
 
 @dataclass
+class ItemRecord:
+    """단일 드랍 기록."""
+
+    map_name: str
+    description: str
+    value: float
+    quantity: int
+    timestamp: datetime = field(default_factory=datetime.now)
+
+    @property
+    def total_value(self) -> float:
+        return self.value * self.quantity
+
+    def to_log_line(self) -> str:
+        time_str = self.timestamp.strftime("%H:%M:%S")
+        name = self.description or "드랍"
+        quantity = f" x{self.quantity}" if self.quantity != 1 else ""
+        return f"[{time_str}] {name}{quantity}: {self.total_value:.2f}"
+
+
+@dataclass
 class MapSession:
     """State for the currently active map."""
 
     name: str
     timer: Timer = field(default_factory=Timer)
     total_value: float = 0.0
-    items: List[str] = field(default_factory=list)
+    items: List[ItemRecord] = field(default_factory=list)
+    started_at: datetime = field(default_factory=datetime.now)
 
     def start(self) -> None:
         self.timer.reset()
         self.timer.start()
+        self.started_at = datetime.now()
 
-    def record_item(self, description: str, value: float) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.items.append(f"[{timestamp}] {description}: {value:.2f}")
-        self.total_value += value
+    def record_item(self, description: str, value: float, quantity: int = 1) -> ItemRecord:
+        record = ItemRecord(
+            map_name=self.name,
+            description=description,
+            value=value,
+            quantity=quantity,
+        )
+        self.items.append(record)
+        self.total_value += record.total_value
+        return record
 
 
 @dataclass
@@ -96,7 +127,8 @@ class MapSummary:
     name: str
     duration: timedelta
     total_value: float
-    items: List[str]
+    items: List[ItemRecord]
+    started_at: datetime
 
 
 class FarmingTracker(cmd.Cmd):
@@ -113,6 +145,9 @@ class FarmingTracker(cmd.Cmd):
         self.overall_total = 0.0
         self.current_map: Optional[MapSession] = None
         self.last_map: Optional[MapSummary] = None
+        self.map_history: List[MapSummary] = []
+        self.item_log: List[ItemRecord] = []
+        self.export_dir = Path.cwd()
 
     # ------------------------------------------------------------------
     # Core commands
@@ -138,12 +173,20 @@ class FarmingTracker(cmd.Cmd):
             print(f"맵_시간             : {_format_timedelta(map_duration)}")
             print(f"맵_파밍_결정        : {map_total:.2f}")
             print(f"맵_분당_파밍_결정   : {per_minute:.2f}")
+            if self.current_map.items:
+                print("- 최근 드랍:")
+                for record in self.current_map.items[-5:]:
+                    print(f"    {record.to_log_line()}")
         elif self.last_map is not None:
             per_minute = _per_minute(self.last_map.total_value, self.last_map.duration)
             print(f"마지막 맵           : {self.last_map.name}")
             print(f"맵_시간             : {_format_timedelta(self.last_map.duration)}")
             print(f"맵_파밍_결정        : {self.last_map.total_value:.2f}")
             print(f"맵_분당_파밍_결정   : {per_minute:.2f}")
+            if self.last_map.items:
+                print("- 기록된 아이템:")
+                for record in self.last_map.items:
+                    print(f"    {record.to_log_line()}")
         else:
             print("맵 정보가 없습니다. 'enter'로 맵을 시작하세요.")
 
@@ -177,9 +220,9 @@ class FarmingTracker(cmd.Cmd):
         self.current_map.start()
         if cost:
             cost_value = -abs(cost)
-            self.current_map.total_value += cost_value
-            self.overall_total += cost_value
-            self.current_map.items.append(f"시작 비용: {cost_value:.2f}")
+            cost_record = self.current_map.record_item("시작 비용", cost_value, 1)
+            self.overall_total += cost_record.total_value
+            self.item_log.append(cost_record)
 
         print(
             f"'{name}' 맵을 시작했습니다. 초기 비용 {cost:.2f}이 반영되었습니다."
@@ -216,14 +259,13 @@ class FarmingTracker(cmd.Cmd):
         if description_parts and description_parts[-1].isdigit():
             quantity = int(description_parts.pop())
 
-        description = " ".join(description_parts) if description_parts else "드랍".strip()
-        total_value = value * quantity
-
-        self.current_map.record_item(description, total_value)
-        self.overall_total += total_value
+        description = " ".join(description_parts).strip()
+        record = self.current_map.record_item(description, value, quantity)
+        self.item_log.append(record)
+        self.overall_total += record.total_value
 
         print(
-            f"아이템 기록 완료: {description or '드랍'} x{quantity} (총 {total_value:.2f})."
+            f"아이템 기록 완료: {description or '드랍'} x{quantity} (총 {record.total_value:.2f})."
         )
 
     def do_exit(self, arg: str) -> None:  # noqa: D401 - cmd.Cmd signature
@@ -239,8 +281,10 @@ class FarmingTracker(cmd.Cmd):
             duration=self.current_map.timer.elapsed(),
             total_value=self.current_map.total_value,
             items=list(self.current_map.items),
+            started_at=self.current_map.started_at,
         )
         self.last_map = summary
+        self.map_history.append(summary)
         print(
             "\n맵 종료" 
             f"\n- 이름   : {summary.name}"
@@ -250,8 +294,8 @@ class FarmingTracker(cmd.Cmd):
         )
         if summary.items:
             print("- 로그   :")
-            for line in summary.items:
-                print(f"    {line}")
+            for record in summary.items:
+                print(f"    {record.to_log_line()}")
 
         self.current_map = None
 
@@ -263,7 +307,137 @@ class FarmingTracker(cmd.Cmd):
         self.overall_total = 0.0
         self.current_map = None
         self.last_map = None
+        self.map_history.clear()
+        self.item_log.clear()
         print("전체 세션이 초기화되었습니다.")
+
+    # ------------------------------------------------------------------
+    # 추가 기능
+
+    def do_history(self, arg: str) -> None:  # noqa: D401 - cmd.Cmd signature
+        """이전 맵 기록을 요약해 보여줍니다.
+
+        Usage: history [개수]
+
+        ``개수``를 지정하면 최근 N개의 맵만 출력합니다.
+        """
+
+        if not self.map_history:
+            print("저장된 맵 기록이 없습니다.")
+            return
+
+        limit = None
+        if arg.strip():
+            try:
+                limit = int(arg.strip())
+            except ValueError:
+                print("개수는 정수여야 합니다.")
+                return
+
+        records = self.map_history[-limit:] if limit is not None else self.map_history
+        start_index = len(self.map_history) - len(records) + 1
+        print("\n===== 맵 기록 =====")
+        header = "번호 | 시작 시각 | 맵 이름 | 진행 시간 | 총 가치 | 분당 가치"
+        print(header)
+        print("-" * len(header))
+        for offset, summary in enumerate(records):
+            per_minute = _per_minute(summary.total_value, summary.duration)
+            print(
+                f"{start_index + offset:>3} | {summary.started_at.strftime('%m-%d %H:%M')} | "
+                f"{summary.name:<10} | {_format_timedelta(summary.duration)} | "
+                f"{summary.total_value:>8.2f} | {per_minute:>8.2f}"
+            )
+        print()
+
+    def do_filter(self, arg: str) -> None:  # noqa: D401 - cmd.Cmd signature
+        """최근 N분 동안의 드랍 합계를 확인합니다.
+
+        Usage: filter <분> [맵이름|전체]
+
+        ``맵이름``을 입력하면 해당 맵만 필터링합니다. ``전체``는 전체 세션입니다.
+        """
+
+        parts = arg.split()
+        if not parts:
+            print("필터링할 시간을 분 단위로 입력하세요. 예: filter 15 전체")
+            return
+
+        try:
+            minutes = float(parts[0])
+        except ValueError:
+            print("시간은 숫자여야 합니다.")
+            return
+
+        scope = parts[1] if len(parts) >= 2 else "전체"
+        cutoff = datetime.now() - timedelta(minutes=minutes)
+
+        if scope == "전체":
+            records: Iterable[ItemRecord] = self.item_log
+        else:
+            records = [r for r in self.item_log if r.map_name == scope]
+
+        filtered = [r for r in records if r.timestamp >= cutoff]
+
+        if not filtered:
+            print("해당 조건에 맞는 드랍 기록이 없습니다.")
+            return
+
+        total_value = sum(r.total_value for r in filtered)
+        print(
+            f"\n최근 {minutes:.1f}분 동안의 '{scope}' 기록 요약"
+            f"\n- 드랍 수 : {len(filtered)}"
+            f"\n- 총 가치 : {total_value:.2f}"
+        )
+        print("- 상세 로그:")
+        for record in filtered:
+            print(f"    [{record.map_name}] {record.to_log_line()}")
+        print()
+
+    def do_export(self, arg: str) -> None:  # noqa: D401 - cmd.Cmd signature
+        """현재까지의 맵 요약을 CSV 파일로 저장합니다.
+
+        Usage: export [파일이름]
+
+        기본 파일명은 ``tli_tracker_export.csv``이며, 실행 디렉터리에 생성됩니다.
+        """
+
+        if not self.map_history:
+            print("내보낼 맵 기록이 없습니다.")
+            return
+
+        filename = arg.strip() or "tli_tracker_export.csv"
+        target = self.export_dir / filename
+
+        with target.open("w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(
+                [
+                    "순번",
+                    "맵 이름",
+                    "시작 시각",
+                    "진행 시간(초)",
+                    "총 가치",
+                    "분당 가치",
+                    "기록된 아이템 수",
+                ]
+            )
+
+            for idx, summary in enumerate(self.map_history, start=1):
+                duration_seconds = int(summary.duration.total_seconds())
+                per_minute = _per_minute(summary.total_value, summary.duration)
+                writer.writerow(
+                    [
+                        idx,
+                        summary.name,
+                        summary.started_at.isoformat(),
+                        duration_seconds,
+                        f"{summary.total_value:.2f}",
+                        f"{per_minute:.2f}",
+                        len(summary.items),
+                    ]
+                )
+
+        print(f"CSV 파일이 저장되었습니다: {target}")
 
     def do_quit(self, arg: str) -> bool:  # noqa: D401 - cmd.Cmd signature
         """Exit the tracker."""
