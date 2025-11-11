@@ -148,7 +148,6 @@ class ItemValueAggregator:
                         continue
                     yield stats
 
-
     def snapshot_all(self) -> List[Dict[str, object]]:
         """Return immutable snapshots for all tracked items."""
 
