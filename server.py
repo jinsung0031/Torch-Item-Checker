@@ -9,13 +9,15 @@ implementation straightforward; for production usage you can swap the
 
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Lock
 from typing import Deque, Dict, Iterable, List, Optional, Tuple
+from html import escape
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, validator
 
 
@@ -146,6 +148,17 @@ class ItemValueAggregator:
                         continue
                     yield stats
 
+
+    def snapshot_all(self) -> List[Dict[str, object]]:
+        """Return immutable snapshots for all tracked items."""
+
+        with self._lock:
+            return [
+                stats.snapshot()
+                for by_currency in self._stats.values()
+                for stats in by_currency.values()
+            ]
+
     def get_entries(
         self,
         item_name: str,
@@ -256,6 +269,156 @@ def _entry_to_response(entry: StoredItemEntry) -> ItemEntryResponse:
 
 def _stats_to_response(stats: ItemStats) -> ItemStatsResponse:
     return ItemStatsResponse(**stats.snapshot())
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> HTMLResponse:
+    """Render a lightweight HTML dashboard for quick manual inspection."""
+
+    snapshots = aggregator.snapshot_all()
+    grouped: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    for snapshot in snapshots:
+        grouped[snapshot["item_name"]].append(snapshot)
+
+    # Sort items by total accumulated value (descending) for relevance.
+    sorted_items = sorted(
+        grouped.items(),
+        key=lambda item: sum(stats["total_value"] for stats in item[1]),
+        reverse=True,
+    )
+
+    rows: List[str] = []
+    for item_name, stats_list in sorted_items:
+        stats_list.sort(key=lambda stats: stats["currency"].lower())
+        for index, stats in enumerate(stats_list):
+            last_updated = stats["last_updated"].strftime("%Y-%m-%d %H:%M:%S UTC")
+            row_cells = [
+                f"<td>{escape(stats['currency'])}</td>",
+                f"<td class=\"num\">{stats['submissions']}</td>",
+                f"<td class=\"num\">{stats['total_value']:.2f}</td>",
+                f"<td class=\"num\">{stats['total_quantity']}</td>",
+                f"<td class=\"num\">{stats['average_per_submission']:.2f}</td>",
+                f"<td class=\"num\">{stats['average_per_unit']:.2f}</td>",
+                f"<td class=\"num\">{stats['min_value']:.2f}</td>",
+                f"<td class=\"num\">{stats['max_value']:.2f}</td>",
+                f"<td>{escape(last_updated)}</td>",
+            ]
+
+            if index == 0:
+                row_item = (
+                    f"<td rowspan=\"{len(stats_list)}\" class=\"item\">"
+                    f"{escape(item_name)}</td>"
+                )
+            else:
+                row_item = ""
+
+            rows.append("<tr>" + row_item + "".join(row_cells) + "</tr>")
+
+    if not rows:
+        rows.append(
+            "<tr><td colspan=\"10\" class=\"empty\">아직 제출된 아이템이 없습니다. "
+            "POST /items 로 데이터를 추가해 주세요.</td></tr>"
+        )
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang=\"ko\">
+      <head>
+        <meta charset=\"utf-8\" />
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+        <meta http-equiv=\"refresh\" content=\"30\" />
+        <title>Torch Item Value Dashboard</title>
+        <style>
+          body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #0f1419;
+            color: #f2f4f8;
+            margin: 0;
+            padding: 2rem;
+          }}
+          h1 {{
+            font-size: 1.8rem;
+            margin-bottom: 0.5rem;
+          }}
+          p {{
+            margin-top: 0;
+            color: #9ba1a6;
+          }}
+          table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1.5rem;
+            background: #141c24;
+            border-radius: 12px;
+            overflow: hidden;
+          }}
+          th, td {{
+            padding: 0.6rem 0.8rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+          }}
+          th {{
+            background: rgba(255, 255, 255, 0.05);
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.08em;
+            color: #aab4be;
+          }}
+          tr:hover {{
+            background: rgba(255, 255, 255, 0.04);
+          }}
+          td.num {{
+            font-variant-numeric: tabular-nums;
+            text-align: right;
+          }}
+          td.item {{
+            font-weight: 600;
+          }}
+          td.empty {{
+            text-align: center;
+            padding: 1.5rem;
+            color: #76808a;
+          }}
+          footer {{
+            margin-top: 2rem;
+            font-size: 0.8rem;
+            color: #5f6b78;
+          }}
+          a {{
+            color: #64b5f6;
+          }}
+        </style>
+      </head>
+      <body>
+        <h1>커뮤니티 드랍 가치 현황</h1>
+        <p>이 화면은 30초마다 자동으로 새로고침됩니다. REST API는 <code>/docs</code>에서 확인할 수 있습니다.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>아이템</th>
+              <th>화폐</th>
+              <th>제출</th>
+              <th>총 가치</th>
+              <th>총 수량</th>
+              <th>평균(제출)</th>
+              <th>평균(개당)</th>
+              <th>최소</th>
+              <th>최대</th>
+              <th>최근 업데이트</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows)}
+          </tbody>
+        </table>
+        <footer>
+          Torch Item Value Exchange &mdash; 공유 데이터는 서버가 재시작되면 초기화됩니다.
+        </footer>
+      </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
 
 
 @app.post("/items", response_model=ItemSubmissionResponse, status_code=201)
