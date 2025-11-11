@@ -2,7 +2,8 @@
 
 Torch Item Checker는 토치에서 파밍한 아이템의 가치를 시간 대비로 계산하는
 터미널 도구입니다. 전체 세션과 맵 단위의 타이머/수익을 동시에 관리할 수
-있도록 설계되었습니다.
+있도록 설계되었습니다. 추가로, FastAPI 기반의 경량 서버를 제공해 다른
+플레이어들과 드랍 가치를 공유하고 평균값을 즉시 조회할 수 있습니다.
 
 ## 요구 사항
 
@@ -37,3 +38,44 @@ python torch_item_checker.py
 `export` 명령으로 생성되는 CSV에는 시작 시각(ISO8601), 맵 진행 시간(초), 총 가치,
 분당 가치, 기록된 아이템 수가 포함됩니다. 스프레드시트 프로그램에서 불러와
 시간대별/맵별 필터링, 추가 분석을 이어서 진행할 수 있습니다.
+
+## FastAPI 서버 (아이템 가치 공유)
+
+커뮤니티에서 입력한 드랍 가치를 모아 평균, 최소/최대값 등을 확인하려면
+FastAPI 서버를 실행하세요. Python 3.9 이상에서 다음 패키지가 필요합니다.
+
+```bash
+pip install "fastapi>=0.110" "uvicorn[standard]>=0.29"
+```
+
+설치가 끝나면 프로젝트 루트에서 아래 명령으로 서버를 가동합니다.
+
+```bash
+uvicorn server:app --reload
+```
+
+서버는 기본적으로 `http://127.0.0.1:8000`에서 동작하며 자동 문서(`/docs`)를
+제공합니다. 핵심 엔드포인트는 다음과 같습니다.
+
+| 메서드/경로 | 설명 |
+| --- | --- |
+| `POST /items` | 아이템 이름, 가치, 화폐, 수량(옵션)을 제출해 커뮤니티 데이터에 합산합니다. |
+| `GET /items/{item_name}` | 특정 아이템의 화폐별 집계(제출 횟수, 총합, 평균, 최소/최대)를 조회합니다. |
+| `GET /items/{item_name}/entries` | 최신 제출 이력을 확인합니다. |
+| `GET /items?query=검색어` | 부분 일치로 등록된 아이템을 찾습니다. |
+
+예시 요청은 다음과 같습니다.
+
+```bash
+# 1. 드랍 가치를 제출
+curl -X POST "http://127.0.0.1:8000/items" \
+  -H "Content-Type: application/json" \
+  -d '{"item_name":"Divine Orb","value":180,"currency":"chaos","map_name":"Atoll"}'
+
+# 2. 누적된 통계 조회
+curl "http://127.0.0.1:8000/items/Divine%20Orb"
+```
+
+현재 구현은 메모리에 데이터를 보관하므로 서버가 재시작되면 초기화됩니다.
+Redis, PostgreSQL 등 지속형 저장소를 붙이고 싶다면
+`server.py`의 `ItemValueAggregator`를 교체하면 됩니다.
